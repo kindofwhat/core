@@ -36,7 +36,7 @@ open class FormElement(parent: Element) : Element(parent)
 fun ElementCreator<Element>.form(attributes: Map<String, Any> = attr) = FormElement(element("form", attributes))
 
 open class AElement(parent: Element) : Element(parent)
-fun ElementCreator<Element>.a(href : String? = null, attributes: Map<String, Any> = attr) = AElement(element("a",
+fun ElementCreator<Element>.a(attributes: Map<String, Any> = attr, href : String? = null) = AElement(element("a",
         attributes.set("href", href)))
 
 open class TextAreaElement(parent: Element) : Element(parent) {
@@ -50,6 +50,10 @@ fun ElementCreator<Element>.textArea(rows : Int? = null, attributes: Map<String,
 
 open class SelectElement(parent: Element) : Element(parent)
 fun ElementCreator<Element>.select(attributes: Map<String, Any> = attr) = SelectElement(element("select", attributes))
+
+open class OptionElement(parent: Element) : Element(parent)
+fun ElementCreator<Element>.option(attributes: Map<String, Any> = attr) = OptionElement(element("option", attributes))
+
 
 open class H1Element(parent: Element) : Element(parent)
 fun ElementCreator<Element>.h1(attributes: Map<String, Any> = attr) = H1Element(element("h1", attributes))
@@ -87,3 +91,6 @@ fun ElementCreator<Element>.img(src: String? = null, attributes: Map<String, Any
 open class CanvasElement(parent : Element) : Element(parent)
 fun ElementCreator<Element>.canvas(width : Int, height : Int)
     = CanvasElement(element("canvas", mapOf("width" to width, "height" to height)))
+
+open class BrElement(parent: Element) : Element(parent)
+fun ElementCreator<Element>.br(attributes: Map<String, Any> = attr) = BrElement(element("br", attributes))

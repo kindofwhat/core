@@ -2,14 +2,17 @@ package io.kweb.dom.element
 
 import com.github.salomonbrys.kotson.toJson
 import io.kweb.*
+import io.kweb.Server2ClientMessage.Instruction
+import io.kweb.Server2ClientMessage.Instruction.Type
+import io.kweb.Server2ClientMessage.Instruction.Type.*
 import io.kweb.dom.element.creation.ElementCreator
 import io.kweb.dom.element.creation.tags.h1
 import io.kweb.dom.element.modification.StyleReceiver
 import io.kweb.dom.element.read.ElementReader
 import io.kweb.plugins.KWebPlugin
-import io.kweb.state.ReadOnlyBindable
+import io.kweb.state.KVal
 import java.util.*
-import java.util.concurrent.CompletableFuture
+import java.util.concurrent.*
 import kotlin.reflect.KClass
 
 @DslMarker
@@ -22,8 +25,8 @@ annotation class KWebDSL
 
 
 @KWebDSL
-open class Element (open val webBrowser: WebBrowser, val creator : ElementCreator<*>?, open var jsExpression: String, val tag : String? = null, val id: String? = null) {
-    constructor(element: Element) : this(element.webBrowser, element.creator, jsExpression = element.jsExpression, tag = element.tag, id = element.id)
+open class Element(open val browser: WebBrowser, val creator: ElementCreator<*>?, open var jsExpression: String, val tag: String? = null, val id: String?) {
+    constructor(element: Element) : this(element.browser, element.creator, jsExpression = element.jsExpression, tag = element.tag, id = element.id)
     /*********
      ********* Low level methods
      *********/
@@ -34,7 +37,7 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
      * are based.
      */
     fun execute(js: String) {
-        webBrowser.execute(js)
+        browser.execute(js)
     }
 
     /**
@@ -43,7 +46,7 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
      * are based.
      */
     fun <O> evaluate(js: String, outputMapper: (String) -> O): CompletableFuture<O>? {
-        return webBrowser.evaluate(js).thenApply(outputMapper)
+        return browser.evaluate(js).thenApply(outputMapper)
     }
 
     /*********
@@ -56,12 +59,12 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
      * This should be called by any function that requires a particular plugin or
      * plugins be present.
      */
-    fun assertPluginLoaded(vararg plugins: KClass<out KWebPlugin>) = webBrowser.require(*plugins)
+    fun assertPluginLoaded(vararg plugins: KClass<out KWebPlugin>) = browser.require(*plugins)
 
     /**
      * Obtain the instance of a plugin by its [KClass].
      */
-    fun <P : KWebPlugin> plugin(plugin: KClass<P>) = webBrowser.plugin(plugin)
+    fun <P : KWebPlugin> plugin(plugin: KClass<P>) = browser.plugin(plugin)
 
 
     /**
@@ -76,10 +79,16 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
     /**
      * Set an attribute of this element.  For example `a().setAttribute("href", "http://kweb.io")`
      * will create an `<a>` element and set it to `<a href="http://kweb.io/">`.
+     *
+     * Will be ignored if `value` is `null`.
      */
     fun setAttribute(name: String, value: Any?): Element {
         if (value != null) {
-            execute("$jsExpression.setAttribute(\"${name.escapeEcma()}\", ${value.toJson()});")
+            if (canSendInstruction()) {
+                browser.send(Instruction(type = SetAttribute, parameters = listOf(id, name, value)))
+            } else {
+                execute("$jsExpression.setAttribute(\"${name.escapeEcma()}\", ${value.toJson()});")
+            }
             if (name == "id") {
                 jsExpression = "document.getElementById(${value.toJson()})"
             }
@@ -87,7 +96,7 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
         return this
     }
 
-    fun setAttribute(name : String, oValue : ReadOnlyBindable<Any>) : Element {
+    fun setAttribute(name : String, oValue : KVal<Any>) : Element {
         setAttribute(name, oValue.value)
         val handle = oValue.addListener { _, newValue ->
             setAttribute(name, newValue)
@@ -99,17 +108,37 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
     }
 
     fun removeAttribute(name: String): Element {
-        execute("$jsExpression.removeAttribute(\"${name.escapeEcma()}\");")
+        if (canSendInstruction()) {
+            browser.send(Instruction(Type.RemoveAttribute, listOf(id, name)))
+        } else {
+            execute("$jsExpression.removeAttribute(\"${name.escapeEcma()}\");")
+        }
         return this
     }
 
-    fun setInnerHTML(value: String): Element {
-        execute("$jsExpression.innerHTML=\"${value.escapeEcma()}\";")
+    fun innerHTML(html: String): Element {
+        execute("$jsExpression.innerHTML=\"${html.escapeEcma()}\";")
+        return this
+    }
+
+    fun innerHTML(html: KVal<String>) : Element {
+        this.innerHTML(html)
+        val handle = html.addListener{ _, new ->
+            innerHTML(new)
+        }
+        this.creator?.onCleanup(true) {
+            html.removeListener(handle)
+        }
         return this
     }
 
     fun focus() : Element {
         execute("$jsExpression.focus();")
+        return this
+    }
+
+    fun blur() : Element {
+        execute("$jsExpression.blur();")
         return this
     }
 
@@ -187,10 +216,10 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
     }
 
     /**
-     * Set the text of this element to an [ReadOnlyBindable] value.  If the text in the ReadOnlyBindable
+     * Set the text of this element to an [KVal] value.  If the text in the KVal
      * changes the text of this element will update automatically.
      */
-    fun text(text: ReadOnlyBindable<String>) : Element {
+    fun text(text: KVal<String>) : Element {
         this.text(text.value)
         val handle = text.addListener{ _, new ->
             text(new)
@@ -202,12 +231,16 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
     }
 
     fun addText(value: String): Element {
-        execute("""
+        if (canSendInstruction()) {
+            browser.send(Instruction(AddText, listOf(id, value)))
+        } else {
+            execute("""
                 {
                     var ntn=document.createTextNode("${value.escapeEcma()}");
                     $jsExpression.appendChild(ntn);
                 }
         """)
+        }
         return this
     }
 
@@ -217,7 +250,7 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
                 $jsCode
             });
         """.trimIndent()
-        webBrowser.evaluate(wrappedJS)
+        browser.evaluate(wrappedJS)
     }
 
     fun addEventListener(eventName: String, returnEventFields : Set<String> = Collections.emptySet(), callback: (String) -> Unit): Element {
@@ -228,11 +261,11 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
                 callbackWs($callbackId, $eventObject);
             });
         """
-        webBrowser.executeWithCallback(js, callbackId) { payload ->
+        browser.executeWithCallback(js, callbackId) { payload ->
             callback.invoke(payload)
         }
         this.creator?.onCleanup(true) {
-            webBrowser.removeCallback(callbackId)
+            browser.removeCallback(callbackId)
         }
         return this
     }
@@ -247,25 +280,30 @@ open class Element (open val webBrowser: WebBrowser, val creator : ElementCreato
 
     fun spellcheck(spellcheck : Boolean = true) = setAttribute("spellcheck", spellcheck)
 
-    val Element.style get() = StyleReceiver(this)
+    val style get() = StyleReceiver(this)
+
+    val flags = ConcurrentSkipListSet<String>()
+
+    fun canSendInstruction() = id != null && browser.kweb.isNotCatchingOutbound()
+
 }
 
 /**
  * Returns an [ElementCreator] which can be used to create new elements and add them
  * as children of the receiver element.
  *
- * @receiver This will be the addToElement element of any elements created with the returned
+ * @receiver This will be the parent element of any elements created with the returned
  *           [ElementCreator]
- * @Param position What position among the addToElement's children should the new element have?
+ * @Param position What position among the parent's children should the new element have?
  *
  * @sample new_sample_1
  */
-fun <ELEMENT_TYPE : Element> ELEMENT_TYPE.new(position : Int? = null): ElementCreator<ELEMENT_TYPE> = ElementCreator(addToElement = this, position = position)
+fun <ELEMENT_TYPE : Element> ELEMENT_TYPE.new(position: Int? = null): ElementCreator<ELEMENT_TYPE> = ElementCreator(parent = this, position = position)
 
 /**
  * A convenience wrapper around [new] which allows a nested DSL-style syntax
  *
-* @Param position What position among the addToElement's children should the new element have?
+ * @Param position What position among the parent's children should the new element have?
  *
  * @sample new_sample_2
  */
@@ -273,8 +311,7 @@ fun <ELEMENT_TYPE : Element, RETURN_VALUE_TYPE : Any> ELEMENT_TYPE.new(
         position : Int? = null,
         receiver: ElementCreator<ELEMENT_TYPE>.() -> RETURN_VALUE_TYPE)
         : RETURN_VALUE_TYPE {
-    val r = receiver(new(position))
-    return r
+    return receiver(new(position))
 }
 
 

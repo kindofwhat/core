@@ -13,48 +13,67 @@ import kotlin.properties.Delegates
  * Stores a value which can change, and allows listeners to be attached which will be called if/when the
  * value changes.
  *
- * @sample bindable_sample
+ * @sample state_sample
  */
 
 private val logger = KotlinLogging.logger {}
 
-open class ReadOnlyBindable<T : Any>(initialValue: T) {
-    private @Volatile var isClosed = false
+open class KVal<T : Any?>(value: T) {
+    @Volatile
+    internal var isClosed = false
 
-    protected val listeners = ConcurrentHashMap<Long, (T, T) -> Unit>()
+    protected val listeners  = ConcurrentHashMap<Long, (T, T) -> Unit>()
     private val closeHandlers = ConcurrentLinkedDeque<() -> Unit>()
 
     fun addListener(listener : (T, T) -> Unit) : Long {
-        assertNotClosed()
         val handle = random.nextLong()
         listeners[handle] = listener
         return handle
     }
 
-    private @Volatile var value_: T = initialValue
+    @Volatile
+    private var pValue: T = value
 
     open val value : T get() {
-        assertNotClosed()
-        return value_
+        return pValue
     }
 
     fun removeListener(handle: Long) {
-        assertNotClosed()
         listeners.remove(handle)
     }
 
-    fun <O : Any> map(mapper: (T) -> O): ReadOnlyBindable<O> {
-        assertNotClosed()
-        val newObservable = ReadOnlyBindable(mapper(value_))
+    // TODO: A cachetime could be specified, to limit recalculation, could be quite broadly useful for expensive
+    //       mappings
+    fun <O : Any> map(mapper: (T) -> O): KVal<O> {
+        if (isClosed) {
+            throw IllegalStateException("Mapping an already closed KVar")
+        }
+        val newObservable = KVal(mapper(pValue))
         val handle = addListener { old, new ->
-            if (new != value_) {
-                val mappedValue = mapper(new)
-                newObservable.value_ = mappedValue
-                newObservable.listeners.values.forEach { it(mapper(old), mappedValue) }
+            if (!isClosed && !newObservable.isClosed) {
+                if (new != pValue) {
+                    val mappedValue = mapper(new)
+                    newObservable.pValue = mappedValue
+                    newObservable.listeners.values.forEach {
+                        try {
+                            it(mapper(old), mappedValue)
+                        } catch (e: Exception) {
+                            logger.warn("Exception thrown by listener", e)
+                        }
+
+                    }
+                }
+            } else {
+                logger.warn("Not propagating change to mapped variable because this or the other observable are closed, old: $old, new: $new")
             }
         }
         newObservable.onClose { removeListener(handle) }
-        this.onClose { newObservable.close() }
+        this.onClose {
+            newObservable.close()
+        }
+  //      newObservable.onClose {
+  //          this.close()
+  //      }
         return newObservable
     }
 
@@ -82,58 +101,70 @@ open class ReadOnlyBindable<T : Any>(initialValue: T) {
         } else {
             isClosed = true
             closedStack = Thread.currentThread().stackTrace
+            closeHandlers.forEach { it.invoke() }
         }
-        closeHandlers.forEach { it.invoke() }
     }
 
     fun onClose(handler: () -> Unit) {
-        assertNotClosed()
+        if (isClosed) {
+            //logger.debug("Shouldn't be called after KVar is closed()")
+            logger.warn("Adding a closer handler to an already closed KVar", IllegalStateException())
+        }
         closeHandlers += handler
     }
 
-    internal fun assertNotClosed() {
-        if (isClosed) {
-            logger.debug("Shouldn't be called after Bindable is closed()")
-        }
+    override fun toString(): String {
+        return "KVal($value)"
     }
+
 }
 
-interface ReversableFunction<Input, Output> {
-    fun map(from : Input) : Output
+abstract class ReversableFunction<Input, Output>(val label : String) {
+    abstract operator fun invoke(from : Input) : Output
 
-    fun unmap(original : Input, change : Output) : Input
+    abstract fun reverse(original : Input, change : Output) : Input
 }
 
-class Bindable<T : Any>(initialValue: T) : ReadOnlyBindable<T>(initialValue) {
+class KVar<T : Any?>(initialValue: T) : KVal<T>(initialValue) {
     override var value: T by Delegates.observable(initialValue) { _, old, new ->
-        assertNotClosed()
         if (old != new) {
-            listeners.values.forEach { it(old, new) }
+            if (isClosed) {
+                logger.warn("Modifying a value in a closed KVar", IllegalStateException("Modifying a value in a closed KVar"))
+            }
+            listeners.values.forEach { v ->
+                v(old, new)
+
+            }
         }
     }
 
-
-
-    fun <O : Any> map(rf : ReversableFunction<T, O>): Bindable<O> {
-        assertNotClosed()
-        val mappedObservable = Bindable(rf.map(value))
+    fun <O : Any> map(reversableFunction : ReversableFunction<T, O>): KVar<O> {
+        if (isClosed) {
+            //logger.debug("Shouldn't be called after KVar is closed()")
+            logger.warn("Mapping an already closed KVar", IllegalStateException())
+        }
+        val mappedObservable = KVar(reversableFunction(value))
         val myChangeHandle = addListener { _, new ->
-            mappedObservable.value = rf.map(new)
+            mappedObservable.value = reversableFunction.invoke(new)
         }
         onClose { removeListener(myChangeHandle) }
-        val origChangeHandle = mappedObservable.addListener({ _, new ->
-            value = rf.unmap(value, new)
-        })
+        val origChangeHandle = mappedObservable.addListener { _, new ->
+            value = reversableFunction.reverse(value, new)
+        }
         onClose { mappedObservable.removeListener(origChangeHandle)}
         return mappedObservable
     }
+
+    // TODO: for debugging
+    val numChangeListeners get() = super.listeners.size
 }
 
+
 /*
-inline fun <reified T : Any> Shoebox<T>.getAsBindable(key : String) : Bindable<T>? {
+inline fun <reified T : Any> Shoebox<T>.getAsBindable(key : String) : KVar<T>? {
     val initialValue = this.get(key)
     return if (initialValue != null) {
-        val b = Bindable(initialValue)
+        val b = KVar(initialValue)
         this.onChange(key, {_, new, _ ->
             b.value = new
         })
@@ -144,11 +175,11 @@ inline fun <reified T : Any> Shoebox<T>.getAsBindable(key : String) : Bindable<T
 }
 */
 
-fun bindable_sample() {
-    val obs = Bindable("Hello")
-    val handle = obs.addListener( {old, new ->
+fun state_sample() {
+    val obs = KVar("Hello")
+    val handle = obs.addListener { old, new ->
         println("obs changed to $old to $new")
-    })
+    }
     obs.value = "Goodbye" // Will print "obs changed to Hello to Goodbye"
     obs.removeListener(handle)
     obs.value = "Hello"   // Nothing will be printed because listener has been removed
